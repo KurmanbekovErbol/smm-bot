@@ -1,15 +1,17 @@
-
-import re, json, os, asyncio, logging, base64, requests
+import re, json, os, asyncio, logging, base64, requests, io
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, types
 from aiogram.types import (
-    Message, ReplyKeyboardMarkup, KeyboardButton,
+    Message, ReplyKeyboardMarkup, KeyboardButton, ContentType,
     InlineKeyboardMarkup, InlineKeyboardButton, InputFile
 )
 from aiogram.dispatcher import FSMContext
 from aiogram.dispatcher.filters import Command
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
 from openai import OpenAI
+from PIL import Image, ImageOps
+import tempfile
+from states import AskState
 from states import AskState
 
 load_dotenv()
@@ -90,7 +92,18 @@ system_prompt = {
         "  - Колонки (название, тип данных, краткое описание);\n"
         "  - Примеры 1–2 строк данных, если необходимо.\n"
         "- Структура должна быть однозначно понятна, чтобы Excel/Google Sheets или внешняя система смогли создать таблицу.\n\n"
-        
+
+        "3) **Анализ изображений (в режиме 'Задать вопрос')**\n"
+        "- Когда пользователь отправляет фото или изображение в режиме вопросов, анализируй его как часть запроса.\n"
+        "- Для комбинированных запросов (текст + изображение) используй информацию с картинки для ответа.\n"
+        "- Всегда возвращай строго JSON вида: {\"type\": \"text\", \"content\": \"твой ответ с анализом изображения\"}\n\n"
+
+        "При анализе изображений фокусируйся на:\n"
+        "- Маркетинговой составляющей (брендинг, УТП, эмоции)\n"
+        "- Дизайне и юзабилити (если это интерфейс)\n"
+        "- Конкурентных преимуществах/недостатках\n"
+        "- Конкретных рекомендациях по улучшению\n"
+        "- Примеры того, что можно сделать лучше\n\n"        
 
         "Общие требования:\n"
         "- Пиши строго в формате валидного JSON, без текста вне JSON.\n"
@@ -110,6 +123,7 @@ system_prompt = {
         "- Все ответы должны быть чистым текстом без Markdown, заголовков (#), списков (*, -, цифр), форматирования и символов-разделителей.\n"
         "- Не используй комментарии вне JSON и не добавляй пояснений.\n"
         "- Ответы должны быть глубокими, логичными и прикладными."
+        "- Для изображений в режиме вопросов: {\"type\": \"text\", \"content\": \"анализ\"}\n"
 
 
         "Специфика рынка:\n"
@@ -154,18 +168,42 @@ async def cmd_start(message: Message):
     )
 
 def smart_json_fix(text: str):
+    """Исправление и парсинг JSON ответа от GPT"""
     try:
-        candidate = text[text.index("{"): text.rindex("}")+1]
-    except:
-        raise ValueError(f"GPT не вернул JSON. RAW: {text}")
-
-    while candidate.endswith("}}"):
-        candidate = candidate[:-1]
-
-    try:
+        # Ищем начало и конец JSON
+        start_idx = text.find('{')
+        end_idx = text.rfind('}') + 1
+        
+        if start_idx == -1 or end_idx == 0:
+            raise ValueError("Не найден JSON в ответе")
+            
+        candidate = text[start_idx:end_idx]
+        
+        # Пробуем распарсить
         return json.loads(candidate)
     except Exception as e:
-        raise ValueError(f"JSON не разобран: {e}\nRAW: {candidate}")
+        # Пробуем найти и исправить распространенные ошибки
+        logger.error(f"Ошибка парсинга JSON: {e}")
+        
+        # Попытка исправить незакрытые кавычки
+        text = text.replace('\\"', '"')
+        
+        # Ищем JSON с помощью регулярных выражений
+        import re
+        json_pattern = r'\{.*\}'
+        matches = re.findall(json_pattern, text, re.DOTALL)
+        
+        if matches:
+            for match in matches:
+                try:
+                    # Пробуем распарсить каждый найденный JSON
+                    return json.loads(match)
+                except:
+                    continue
+        
+        # Если ничего не помогло, создаем текстовый ответ
+        logger.error(f"Не удалось распарсить JSON. RAW: {text[:500]}")
+        return {"type": "text", "content": f"⚠️ Получен нестандартный ответ. Вот что удалось получить:\n\n{text}"}
 
 async def ensure_access(user_id: int, message: Message):
     if not check_access_api(user_id):
@@ -193,6 +231,139 @@ async def ask_start(message: Message, state: FSMContext):
         return
     await message.answer("📝 Напишите ваш запрос:")
     await AskState.waiting_for_question.set()
+
+async def process_image_with_gpt4v(image_bytes: bytes, user_text: str = "", user_id: int = None):
+    """Обработка изображения через GPT-4V"""
+    try:
+        # Конвертируем в base64
+        base64_image = base64.b64encode(image_bytes).decode('utf-8')
+        
+        # Подготавливаем историю
+        hist = user_history.get(user_id, [])
+        
+        # Формируем сообщения
+        messages = [system_prompt] + hist[-9:]  # Берем последние 9 сообщений истории
+        
+        # Добавляем текущий запрос с изображением
+        content = []
+        if user_text:
+            content.append({"type": "text", "text": user_text})
+        
+        content.append({
+            "type": "image_url",
+            "image_url": {
+                "url": f"data:image/jpeg;base64,{base64_image}",
+                "detail": "high"  # Можно изменить на "low" для экономии токенов
+            }
+        })
+        
+        messages.append({
+            "role": "user",
+            "content": content
+        })
+        
+        # Отправляем запрос
+        response = client.chat.completions.create(
+            model="gpt-4.1-mini",  # Или "gpt-4o" если доступно
+            messages=messages,
+            max_tokens=2000
+        )
+        
+        raw_response = response.choices[0].message.content
+        
+        # Пытаемся распарсить JSON
+        try:
+            data = smart_json_fix(raw_response)
+            return data
+        except Exception as e:
+            logger.error(f"Ошибка парсинга JSON для изображения: {e}")
+            # Возвращаем как текстовый ответ
+            return {"type": "text", "content": raw_response}
+            
+    except Exception as e:
+        logger.error(f"Ошибка GPT-4V: {e}")
+        return {"type": "text", "content": f"⚠️ Ошибка анализа изображения: {str(e)}"}
+    
+async def optimize_image_for_api(image_bytes: bytes, max_size: int = 1024) -> bytes:
+    """Оптимизация изображения для API (уменьшение размера)"""
+    try:
+        image = Image.open(io.BytesIO(image_bytes))
+        
+        # Конвертируем в RGB если нужно
+        if image.mode in ('RGBA', 'LA', 'P'):
+            background = Image.new('RGB', image.size, (255, 255, 255))
+            if image.mode == 'P':
+                image = image.convert('RGBA')
+            background.paste(image, mask=image.split()[-1] if image.mode == 'RGBA' else None)
+            image = background
+        
+        # Уменьшаем размер если слишком большой
+        if max(image.size) > max_size:
+            ratio = max_size / max(image.size)
+            new_size = tuple(int(dim * ratio) for dim in image.size)
+            image = image.resize(new_size, Image.Resampling.LANCZOS)
+        
+        # Сохраняем с оптимизацией
+        output = io.BytesIO()
+        image.save(output, format='JPEG', quality=85, optimize=True)
+        
+        return output.getvalue()
+        
+    except Exception as e:
+        logger.error(f"Ошибка оптимизации изображения: {e}")
+        return image_bytes  # Возвращаем как есть в случае ошибки
+    
+@dp.message_handler(content_types=ContentType.PHOTO, state=AskState.waiting_for_question)
+async def handle_photo_in_question_mode(message: Message, state: FSMContext):
+    """Обработка фото в режиме вопросов"""
+    user_id = message.from_user.id
+    
+    if not check_access_api(user_id):
+        await message.answer("⛔ *Доступ закрыт.*", reply_markup=pay_kb)
+        await state.finish()
+        return
+    
+    # Отправляем сообщение о начале обработки
+    wait_msg = await message.answer("🖼️ Анализирую изображение...")
+    
+    try:
+        # Получаем файл изображения
+        photo = message.photo[-1]  # Берем самое большое изображение
+        file_info = await bot.get_file(photo.file_id)
+        downloaded_file = await bot.download_file(file_info.file_path)
+        image_bytes = downloaded_file.read()
+        
+        # Оптимизируем изображение для API
+        optimized_bytes = await optimize_image_for_api(image_bytes)
+        
+        # Получаем текст запроса (подпись к фото)
+        user_text = message.caption or "Проанализируй это изображение с маркетинговой точки зрения."
+        
+        # Обрабатываем изображение
+        result = await process_image_with_gpt4v(optimized_bytes, user_text, user_id)
+        
+        await wait_msg.delete()  # Удаляем сообщение "Анализирую..."
+        
+        # Обрабатываем результат
+        if result.get("type") == "text":
+            answer = result.get("content", "")
+            hist = user_history.setdefault(user_id, [])
+            hist.append({"role": "user", "content": f"[Изображение] {user_text}"})
+            hist.append({"role": "assistant", "content": answer})
+            hist[:] = hist[-10:]  # Ограничиваем историю
+            
+            formatted_answer = format_answer(answer)
+            await message.answer(formatted_answer)
+            
+        elif result.get("type") == "excel":
+            await process_excel_response(message, result)
+            
+        else:
+            await message.answer(f"📋 *Результат анализа:*\n\n{result.get('content', 'Нет данных')}")
+            
+    except Exception as e:
+        logger.error(f"Ошибка обработки изображения: {e}")
+        await wait_msg.edit_text("⚠️ *Ошибка обработки изображения.* Попробуйте отправить другое изображение или текстовый запрос.")
 
 @dp.message_handler(state=AskState.waiting_for_question)
 async def process_question(message: Message, state: FSMContext):
@@ -306,13 +477,21 @@ async def create_detailed_excel(message: Message, table_json: dict):
                 pass
         ws1.column_dimensions[column].width = max_length + 4
     ws2 = wb.create_sheet("Ответственные и сроки")
-    ws2.append(["Ответственный", "Задача", "Срок", "Статус"])  
+    ws2.append(["Пункт анализа", "Ответственный", "Срок", "Статус"])
+
     for row in rows:
-        ws2.append([row[4], row[1], row[3], "Не начато"]) 
+        ws2.append([
+            row[0],           # Пункт анализа
+            "Не начато"
+        ]) 
     ws3 = wb.create_sheet("Статусы задач")
-    ws3.append(["Задача", "Статус", "Прогресс"])
+    ws3.append(["Пункт анализа", "Статус", "Прогресс"])
+
     for row in rows:
-        ws3.append([row[1], "Не начата", "0%"])
+        ws3.append([
+            row[0],
+            "Не начата"
+        ])
     with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp:
         wb.save(tmp.name)
         filepath = tmp.name

@@ -1,7 +1,7 @@
 import requests
 from django.conf import settings
 
-BOT_TOKEN = '6560882506:AAHoHoIZobShtd2vL_G4ebotigiqrnslhWc'  # твой токен
+BOT_TOKEN = '8599455727:AAGlzDt202yNUdhSy7chOQWjlR20e2opuTs'  # твой токен
 
 def notify_user(chat_id: int, text: str):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
