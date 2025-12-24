@@ -351,9 +351,9 @@ async def handle_photo_in_question_mode(message: Message, state: FSMContext):
             hist.append({"role": "user", "content": f"[Изображение] {user_text}"})
             hist.append({"role": "assistant", "content": answer})
             hist[:] = hist[-10:]  # Ограничиваем историю
-            
-            formatted_answer = format_answer(answer)
-            await message.answer(formatted_answer)
+                        
+            await message.answer(answer)
+
             
         elif result.get("type") == "excel":
             await process_excel_response(message, result)
@@ -400,8 +400,8 @@ async def process_question(message: Message, state: FSMContext):
 async def process_text_response(message: Message, data: dict, hist: list):
     answer = data["content"]
     hist.append({"role": "assistant", "content": answer})
-    formatted_answer = format_answer(answer)
-    await message.answer(formatted_answer)
+    await message.answer(answer)
+
 
 
 async def process_excel_response(message: Message, data: dict):
@@ -554,13 +554,6 @@ async def create_and_send_excel(message: Message, table_json: dict):
         InputFile(filepath),
         caption="📊 *Ваш Excel файл готов!*"
     )
-
-def format_answer(answer: str) -> str:
-    formatted = answer
-    formatted = formatted.replace("\n", "\n\n")  
-    formatted = re.sub(r'(\d+\.)', r'### \1', formatted) 
-    formatted = formatted.replace("Социальные сети", "📱 **Социальные сети**")
-    return formatted
 
 @dp.message_handler(content_types=types.ContentType.VOICE, state="*")
 async def ignore_voice(message: Message, state: FSMContext):
